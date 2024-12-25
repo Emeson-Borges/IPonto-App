@@ -1,16 +1,3 @@
-"""
-Exemplo de App Kivy APRIMORADO com:
-- Cadastro e Registro de Ponto (piscada)
-- Tabela de logs (face_logs)
-- Tela de Relatórios (LogsScreen) para listar e exportar
-- Tela de Configurações (SettingsScreen) para EAR, Tolerância etc.
-- Exemplo de "Sincronizar" logs via POST a um servidor (simulado)
-- Uso de threading para evitar travar a UI
-
-Corrigido para não dar erro ValueError ao trocar Label -> Image 
-nas telas de cadastro e registro de ponto.
-"""
-
 import kivy
 kivy.require("2.1.0")
 
@@ -26,7 +13,15 @@ from kivy.clock import Clock, mainthread
 from kivy.graphics.texture import Texture
 from kivy.uix.image import Image
 from kivy.uix.scrollview import ScrollView
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.label import Label
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.widget import Widget
+from kivy.graphics import Color, Rectangle
 
+
+from cryptography.fernet import Fernet
+from deepface import DeepFace
 import cv2
 import face_recognition
 import numpy as np
@@ -34,6 +29,7 @@ import sqlite3
 import json
 import os
 import math
+import hashlib
 
 from datetime import datetime
 import threading
@@ -48,12 +44,15 @@ MODEL_TYPE = "hog"        # ou "cnn"
 EAR_THRESHOLD = 0.22
 CONSEC_FRAMES_CLOSED = 1
 CONSEC_FRAMES_OPEN = 1
-FACE_RECOG_TOLERANCE = 0.6  # Ajustável
+FACE_RECOG_TOLERANCE = 0.4  # Ajustável
 
 # -----------------------------------------------------
 # BANCO DE DADOS
 # -----------------------------------------------------
 def create_db_if_not_exists():
+    """
+    Cria as tabelas necessárias no banco de dados, incluindo a coluna única para o hash.
+    """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
@@ -61,21 +60,56 @@ def create_db_if_not_exists():
         CREATE TABLE IF NOT EXISTS face_encodings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            encoding TEXT NOT NULL
+            encoding TEXT NOT NULL,
+            encoding_hash TEXT UNIQUE NOT NULL
         )
     ''')
-
     c.execute('''
         CREATE TABLE IF NOT EXISTS face_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             encoding TEXT NOT NULL,
-            date_time TEXT NOT NULL
+            date_time TEXT NOT NULL,
+            log_type TEXT NOT NULL
         )
     ''')
-
     conn.commit()
     conn.close()
+
+
+
+def update_db_schema():
+    """
+    Atualiza o esquema do banco de dados, adicionando a coluna log_type se necessário.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        # Adicionar a coluna log_type, se ela não existir
+        c.execute("ALTER TABLE face_logs ADD COLUMN log_type TEXT")
+    except sqlite3.OperationalError:
+        # A coluna já existe
+        pass
+    conn.commit()
+    conn.close()
+
+def face_already_exists(encoding):
+    """
+    Verifica se o rosto já foi cadastrado no banco de dados com base no hash do encoding.
+    Permite novos registros se os encodings forem únicos.
+    """
+    normalized_encoding = np.array(encoding, dtype=np.float32) / np.linalg.norm(encoding)
+    encoding_hash = hashlib.sha256(json.dumps(normalized_encoding.tolist()).encode()).hexdigest()
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) FROM face_encodings WHERE encoding_hash = ?', (encoding_hash,))
+    count = c.fetchone()[0]
+    conn.close()
+
+    return count > 0
+
+
 
 def user_already_exists(name):
     conn = sqlite3.connect(DB_PATH)
@@ -86,12 +120,63 @@ def user_already_exists(name):
     return (count > 0)
 
 def save_face_encoding(name, encoding):
-    encoding_json = json.dumps(encoding.tolist())
+    """
+    Salva o encoding do rosto no banco de dados, verificando se já existe.
+    """
+    # Normalizar o encoding
+    normalized_encoding = np.array(encoding, dtype=np.float32) / np.linalg.norm(encoding)
+
+    # Gerar o hash do encoding normalizado
+    encoding_json = json.dumps(normalized_encoding.tolist())
+    encoding_hash = hashlib.sha256(encoding_json.encode()).hexdigest()
+
+    # Conexão com o banco
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('INSERT INTO face_encodings (name, encoding) VALUES (?, ?)', (name, encoding_json))
+
+    # Verificar se o hash já existe
+    c.execute('SELECT name, encoding FROM face_encodings WHERE encoding_hash = ?', (encoding_hash,))
+    result = c.fetchone()
+    if result:
+        raise ValueError(f"O rosto já está cadastrado como '{result[0]}'.")
+
+    # Verificar duplicidade com base na similaridade facial
+    c.execute('SELECT name, encoding FROM face_encodings')
+    rows = c.fetchall()
+    for existing_name, existing_enc_json in rows:
+        existing_encoding = np.array(json.loads(existing_enc_json), dtype=np.float32)
+        distance = face_recognition.face_distance([existing_encoding], normalized_encoding)[0]
+        if distance < FACE_RECOG_TOLERANCE:  # Apenas bloquear se muito similar
+            raise ValueError(f"O rosto já está cadastrado como '{existing_name}' (similaridade detectada).")
+
+    # Inserir o novo rosto no banco
+    c.execute(
+        'INSERT INTO face_encodings (name, encoding, encoding_hash) VALUES (?, ?, ?)',
+        (name, encoding_json, encoding_hash)
+    )
     conn.commit()
     conn.close()
+
+
+
+
+def remove_duplicate_encodings():
+    """
+    Remove encodings duplicados do banco de dados, deixando apenas o primeiro registro.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        DELETE FROM face_encodings
+        WHERE id NOT IN (
+            SELECT MIN(id)
+            FROM face_encodings
+            GROUP BY encoding_hash
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
 
 def load_face_encodings():
     conn = sqlite3.connect(DB_PATH)
@@ -109,14 +194,71 @@ def load_face_encodings():
     return known_faces
 
 def save_log_punch(name, encoding):
+    """
+    Salva o log de batida com informação de entrada ou saída.
+    """
     enc_json = json.dumps(encoding.tolist())
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now()
+    now_date = now.strftime("%Y-%m-%d")
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Verifica quantas batidas já ocorreram no mesmo dia para este usuário
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('INSERT INTO face_logs (name, encoding, date_time) VALUES (?, ?, ?)',
-              (name, enc_json, now_str))
+    c.execute('SELECT COUNT(*) FROM face_logs WHERE name = ? AND date_time LIKE ?', (name, now_date + "%"))
+    log_count_today = c.fetchone()[0]
+    conn.close()
+
+    # Define o tipo com base na ordem
+    log_type = "Entrada" if log_count_today % 2 == 0 else "Saída"
+
+    # Salva no banco de dados
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('INSERT INTO face_logs (name, encoding, date_time, log_type) VALUES (?, ?, ?, ?)',
+              (name, enc_json, now_str, log_type))
     conn.commit()
     conn.close()
+
+def ensure_encoding_hash_column():
+    """
+    Garante que a coluna 'encoding_hash' exista na tabela 'face_encodings'.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # Verificar se a coluna 'encoding_hash' já existe
+    c.execute("PRAGMA table_info(face_encodings)")
+    columns = [row[1] for row in c.fetchall()]
+
+    if 'encoding_hash' not in columns:
+        # Adicionar a coluna se não existir
+        c.execute("ALTER TABLE face_encodings ADD COLUMN encoding_hash TEXT UNIQUE")
+
+    conn.commit()
+    conn.close()
+
+
+
+def update_existing_encodings_with_hash():
+    """
+    Atualiza todos os registros existentes na tabela 'face_encodings' para incluir o hash do encoding.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # Busca registros que ainda não têm o hash calculado
+    c.execute("SELECT id, encoding FROM face_encodings WHERE encoding_hash IS NULL")
+    rows = c.fetchall()
+
+    for row_id, encoding_json in rows:
+        encoding = np.array(json.loads(encoding_json), dtype=np.float32)
+        encoding_hash = hashlib.sha256(json.dumps(encoding.tolist()).encode()).hexdigest()
+        c.execute("UPDATE face_encodings SET encoding_hash = ? WHERE id = ?", (encoding_hash, row_id))
+
+    conn.commit()
+    conn.close()
+
+
 
 def load_all_logs():
     conn = sqlite3.connect(DB_PATH)
@@ -125,6 +267,17 @@ def load_all_logs():
     rows = c.fetchall()
     conn.close()
     return rows
+
+key = Fernet.generate_key()
+cipher = Fernet(key)
+
+def encrypt_encoding(encoding):
+    encoding_json = json.dumps(encoding.tolist())
+    return cipher.encrypt(encoding_json.encode())
+
+def decrypt_encoding(encrypted_encoding):
+    return json.loads(cipher.decrypt(encrypted_encoding).decode())
+
 
 # -----------------------------------------------------
 # FUNÇÕES FACE RECOGNITION
@@ -143,6 +296,9 @@ def detect_main_face(frame_rgb):
     return best_loc
 
 def get_face_encoding(frame_bgr):
+    """
+    Obtém o encoding do rosto na imagem e garante consistência no processo.
+    """
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     loc = detect_main_face(frame_rgb)
     if loc is None:
@@ -150,25 +306,88 @@ def get_face_encoding(frame_bgr):
     encs = face_recognition.face_encodings(frame_rgb, known_face_locations=[loc], num_jitters=1)
     if len(encs) == 0:
         return None, None
-    return encs[0], loc
+    # Normalizar o encoding para consistência
+    normalized_enc = np.array(encs[0], dtype=np.float32) / np.linalg.norm(encs[0])
+    return normalized_enc, loc
 
-def compare_with_db(unknown_enc):
+
+
+def compare_with_db(unknown_enc, unknown_img):
+    """
+    Compara um rosto desconhecido com os registros no banco de dados.
+    """
     known_faces = load_face_encodings()
     if not known_faces:
-        return None
+        return None  # Nenhum rosto registrado
 
     best_name = None
-    best_dist = 999
-    for name, arr_list in known_faces.items():
-        for arr in arr_list:
-            dist = face_recognition.face_distance([arr], unknown_enc)[0]
-            if dist < best_dist:
-                best_dist = dist
-                best_name = name
+    best_dist = float('inf')
 
-    if best_dist < FACE_RECOG_TOLERANCE:
-        return best_name
-    return None
+    for name, encodings_list in known_faces.items():
+        for known_enc in encodings_list:
+            # Comparação inicial com face_recognition
+            dist = face_recognition.face_distance([known_enc], unknown_enc)[0]
+            if dist < best_dist and dist < FACE_RECOG_TOLERANCE:
+                best_name = name
+                best_dist = dist
+
+    return best_name
+
+
+
+
+def is_duplicate_face(new_encoding):
+    """
+    Verifica se o rosto já existe no banco de dados com base no hash ou na similaridade facial.
+    """
+    new_encoding_hash = hashlib.sha256(json.dumps(new_encoding.tolist()).encode()).hexdigest()
+
+    # Verifica no banco de dados
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT encoding, encoding_hash FROM face_encodings')
+    rows = c.fetchall()
+    conn.close()
+
+    for encoding_json, encoding_hash in rows:
+        existing_encoding = np.array(json.loads(encoding_json))
+
+        # Comparação por hash
+        if encoding_hash == new_encoding_hash:
+            return True
+
+        # Comparação por similaridade facial
+        dist = face_recognition.face_distance([existing_encoding], new_encoding)[0]
+        if dist < FACE_RECOG_TOLERANCE:
+            return True
+
+    return False
+
+
+
+
+def is_real_face(frame, loc):
+    """
+    Verifica se o rosto é real analisando a textura da imagem.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    (x, y, w, h) = loc
+    roi = gray[y:h, x:w]
+    laplacian_var = cv2.Laplacian(roi, cv2.CV_64F).var()
+    return laplacian_var > 50  # Ajuste o limiar conforme necessário
+
+def average_encodings(encodings):
+    """
+    Calcula a média de múltiplos encodings para criar um perfil robusto.
+    """
+    return np.mean(encodings, axis=0)
+
+def verify_face(image1, image2):
+    """
+    Verifica se dois rostos correspondem usando DeepFace.
+    """
+    result = DeepFace.verify(image1, image2, model_name="Facenet")
+    return result['verified']
 
 # -----------------------------------------------------
 # DETECÇÃO DE PISCADA
@@ -192,6 +411,9 @@ def calc_ear(eye_points):
     return ear
 
 def detect_blink(landmarks, blink_state):
+    """
+    Detecta piscadas com base na razão de aspecto do olho (EAR).
+    """
     left_eye = landmarks.get('left_eye')
     right_eye = landmarks.get('right_eye')
     if not left_eye or not right_eye:
@@ -201,7 +423,7 @@ def detect_blink(landmarks, blink_state):
     right_ear = calc_ear(right_eye)
     avg_ear = (left_ear + right_ear) / 2.0
 
-    eyes_closed = (avg_ear < EAR_THRESHOLD)
+    eyes_closed = avg_ear < EAR_THRESHOLD
 
     if eyes_closed:
         blink_state['frames_closed'] += 1
@@ -220,6 +442,7 @@ def detect_blink(landmarks, blink_state):
         blink_state['frames_open'] = 0
 
     return blink_detected
+
 
 # -----------------------------------------------------
 # TELAS
@@ -241,7 +464,9 @@ class HomeScreen(Screen):
 
         # Logo
         self.logo = Image(
-            source="C:/Users/itarg/Desktop/face_app/logo_rh247.png",
+            # source="C:/Users/itarg/Desktop/face_app/logo_rh247.png", (Imagem Laranja)
+            source="C:/Users/itarg/Desktop/face_app/rh247_azul.png", #(Imagem Azul)
+            
             size_hint=(1, 0.35),
             allow_stretch=True,
             keep_ratio=True
@@ -304,13 +529,10 @@ class HomeScreen(Screen):
 
 
 class RegisterFaceScreen(Screen):
-    """
-    Tela de cadastro (exige piscada).
-    """
     def __init__(self, **kw):
         super().__init__(**kw)
 
-        # Salvar em self.main_layout para podermos trocar o Label pela Image
+        # Layout principal
         self.main_layout = BoxLayout(orientation='vertical', spacing=10, padding=10)
 
         self.label_title = Label(text="Cadastrar Facial", font_size='22sp', size_hint=(1, 0.1))
@@ -331,7 +553,7 @@ class RegisterFaceScreen(Screen):
             size_hint=(1, 0.1),
             font_size="18sp",
             background_color=(0, 0.6, 1, 1),
-            color=(1,1,1,1)
+            color=(1, 1, 1, 1)
         )
         self.btn_capture.bind(on_press=self.on_capture)
         self.main_layout.add_widget(self.btn_capture)
@@ -340,7 +562,7 @@ class RegisterFaceScreen(Screen):
             text="Voltar",
             size_hint=(1, 0.1),
             font_size="18sp",
-            background_color=(0.5,0.5,0.5,1)
+            background_color=(0.5, 0.5, 0.5, 1)
         )
         btn_back.bind(on_press=self.on_back)
         self.main_layout.add_widget(btn_back)
@@ -348,22 +570,16 @@ class RegisterFaceScreen(Screen):
         self.add_widget(self.main_layout)
 
         self.capture = cv2.VideoCapture(0)
-        self.blink_state = {'frames_closed':0, 'frames_open':0, 'eyes_closed_yet':False}
+        self.blink_state = {'frames_closed': 0, 'frames_open': 0, 'eyes_closed_yet': False}
         self.blinked = False
 
-        Clock.schedule_interval(self.update, 1.0/30.0)
-
-    def on_pre_enter(self, *args):
-        if not self.capture.isOpened():
-            self.capture.open(0)
-        self.reset_state()
-
-    def reset_state(self):
-        self.txt_name.text = ""
-        self.blink_state = {'frames_closed':0, 'frames_open':0, 'eyes_closed_yet':False}
-        self.blinked = False
+        # Corrigindo o erro de método ausente
+        Clock.schedule_interval(self.update, 1.0 / 30.0)
 
     def update(self, dt):
+        """
+        Atualiza a visualização da câmera e processa o feed para detecção de rosto e piscadas.
+        """
         if self.manager.current != 'register_screen':
             return
 
@@ -376,59 +592,67 @@ class RegisterFaceScreen(Screen):
             self.camera_widget.text = "(falha na captura)"
             return
 
-        # Processar
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         enc, loc = get_face_encoding(frame)
-        color = (0,0,255)
+        color = (0, 0, 255)
 
         if enc is not None and loc is not None:
-            lands = face_landmarks_for_loc(frame_rgb, loc)
-            if lands is not None:
-                blinked_now = detect_blink(lands, self.blink_state)
+            landmarks = face_landmarks_for_loc(frame_rgb, loc)
+            if landmarks is not None:
+                blinked_now = detect_blink(landmarks, self.blink_state)
                 if blinked_now:
                     self.blinked = True
-                color = (0,255,0) if self.blinked else (0,0,255)
+                color = (0, 255, 0) if self.blinked else (0, 0, 255)
 
+            # Desenha a marcação no rosto
             (top, right, bottom, left) = loc
             cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
 
+        # Atualiza o botão de captura
         self.btn_capture.disabled = not self.blinked
 
-        # Converter p/ exibir
+        # Converter para exibir no Kivy
         frame_disp = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         buf = frame_disp.tobytes()
         texture = Texture.create(size=(frame_disp.shape[1], frame_disp.shape[0]), colorfmt='rgb')
         texture.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
         texture.flip_vertical()
 
-        # Se ainda for Label, trocamos no self.main_layout
         if isinstance(self.camera_widget, Label):
-            try:
-                parent_idx = self.main_layout.children.index(self.camera_widget)
-            except ValueError:
-                parent_idx = 0
-
             self.main_layout.remove_widget(self.camera_widget)
-            self.camera_widget = Image(size_hint=(1,0.6))
-            # Reinsere no mesmo "index" invertido
-            self.main_layout.add_widget(
-                self.camera_widget, 
-                index=len(self.main_layout.children) - parent_idx
-            )
+            self.camera_widget = Image(size_hint=(1, 0.6))
+            self.main_layout.add_widget(self.camera_widget, index=2)
 
         self.camera_widget.texture = texture
 
+
+
+
+    def on_pre_enter(self, *args):
+        if not self.capture.isOpened():
+            self.capture.open(0)
+        self.reset_state()
+        self.label_title.text = "Cadastrar Facial"
+
+
+    def reset_state(self):
+        """
+        Reseta o estado da tela de cadastro.
+        """
+        self.txt_name.text = ""
+        self.label_title.text = "Cadastrar Facial"
+        self.blink_state = {'frames_closed': 0, 'frames_open': 0, 'eyes_closed_yet': False}
+        self.blinked = False
+
     def on_capture(self, instance):
         """
-        Cadastra se piscou e não existe no DB.
+        Cadastra o rosto somente se não for duplicado.
         """
         name = self.txt_name.text.strip()
         if not name:
             self.label_title.text = "Digite um nome!"
             return
-        if user_already_exists(name):
-            self.label_title.text = f"'{name}' já está cadastrado!"
-            return
+
         if not self.blinked:
             self.label_title.text = "Você precisa piscar!"
             return
@@ -437,16 +661,31 @@ class RegisterFaceScreen(Screen):
         if not ret or frame is None:
             self.label_title.text = "Falha ao capturar."
             return
+
         enc, loc = get_face_encoding(frame)
         if enc is None:
             self.label_title.text = "Nenhum rosto detectado!"
             return
 
-        save_face_encoding(name, enc)
-        self.label_title.text = f"Rosto '{name}' cadastrado!"
+        # Tentar salvar o rosto
+        try:
+            # Salvar o encoding
+            save_face_encoding(name, enc)
+            
+            # Salvar a imagem no diretório
+            save_path = f"path_to_face_images/{name}.jpg"
+            cv2.imwrite(save_path, frame)
+
+            self.label_title.text = f"Rosto '{name}' cadastrado com sucesso!"
+        except ValueError as e:
+            self.label_title.text = str(e)
+
 
     def on_back(self, instance):
         self.manager.current = 'home_screen'
+        self.reset_state()
+
+
 
 
 class PointScreen(Screen):
@@ -506,6 +745,7 @@ class PointScreen(Screen):
     def update(self, dt):
         if self.manager.current != 'point_screen':
             return
+
         if not self.capture.isOpened():
             self.camera_widget.text = "(camera não disponível)"
             return
@@ -515,9 +755,11 @@ class PointScreen(Screen):
             self.camera_widget.text = "(falha captura)"
             return
 
+        self.current_frame = frame.copy()  # Armazena o quadro atual
+
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         enc, loc = get_face_encoding(frame)
-        color = (0,0,255)
+        color = (0, 0, 255)
 
         if enc is not None and loc is not None:
             lands = face_landmarks_for_loc(frame_rgb, loc)
@@ -525,23 +767,28 @@ class PointScreen(Screen):
                 blinked_now = detect_blink(lands, self.blink_state)
                 if blinked_now:
                     self.blinked = True
-                    who = compare_with_db(enc)
-                    self.recognized_name = who
+                    who = compare_with_db(enc, self.current_frame)
+                    if who is None:
+                        self.label_title.text = "Nenhum registro encontrado."
+                    else:
+                        self.recognized_name = who
+                        self.label_title.text = f"Bem-vindo(a), {who}!"
                     self.current_enc = enc
 
                 if self.blinked and self.recognized_name:
-                    color = (0,255,0)
+                    color = (0, 255, 0)
                 else:
-                    color = (0,255,0) if (self.blinked and self.recognized_name) else (0,0,255)
+                    color = (0, 255, 0) if (self.blinked and self.recognized_name) else (0, 0, 255)
 
-            (top,right,bottom,left) = loc
-            cv2.rectangle(frame, (left,top),(right,bottom), color,2)
+            (top, right, bottom, left) = loc
+            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
             if self.blinked and self.recognized_name:
-                cv2.putText(frame, self.recognized_name, (left, top-10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color,2)
+                cv2.putText(frame, self.recognized_name, (left, top - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
         self.btn_registrar.disabled = not (self.blinked and self.recognized_name)
 
+        # Atualiza a câmera
         frame_disp = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         buf = frame_disp.tobytes()
         texture = Texture.create(
@@ -551,28 +798,27 @@ class PointScreen(Screen):
         texture.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
         texture.flip_vertical()
 
-        # Se camera_widget ainda for Label, trocamos no self.main_layout
         if isinstance(self.camera_widget, Label):
-            try:
-                parent_idx = self.main_layout.children.index(self.camera_widget)
-            except ValueError:
-                parent_idx = 0
-
             self.main_layout.remove_widget(self.camera_widget)
-            self.camera_widget = Image(size_hint=(1,0.6))
-            self.main_layout.add_widget(
-                self.camera_widget, 
-                index=len(self.main_layout.children) - parent_idx
-            )
+            self.camera_widget = Image(size_hint=(1, 0.6))
+            self.main_layout.add_widget(self.camera_widget, index=2)
 
         self.camera_widget.texture = texture
 
+
+
     def on_register_point(self, instance):
-        if self.recognized_name and self.current_enc is not None:
-            save_log_punch(self.recognized_name, self.current_enc)
-            self.label_title.text = f"Bem-vindo(a), {self.recognized_name}!"
+        if self.current_enc is not None:
+            recognized_name = compare_with_db(self.current_enc, self.current_frame)
+            if recognized_name:
+                save_log_punch(recognized_name, self.current_enc)
+                self.label_title.text = f"Ponto Registrado, {recognized_name}!"
+            else:
+                self.label_title.text = "Nenhum registro encontrado."
         else:
-            self.label_title.text = "Rosto não reconhecido."
+            self.label_title.text = "Nenhum rosto detectado."
+
+
 
     def on_back(self, instance):
         self.manager.current = 'home_screen'
@@ -622,14 +868,64 @@ class LogsScreen(Screen):
 
     def load_logs(self):
         """
-        Carrega a lista de logs e exibe na tela.
+        Carrega a lista de logs e exibe na tela como uma tabela estilizada.
         """
         self.logs_container.clear_widgets()
-        rows = load_all_logs()
-        for (log_id, name, dt, enc) in rows:
-            label_txt = f"ID:{log_id} | {name} | {dt}"
-            lb = Label(text=label_txt, size_hint_y=None, height=40)
-            self.logs_container.add_widget(lb)
+
+        # Criar layout da tabela
+        table = GridLayout(cols=4, size_hint_y=None, padding=[10, 10, 10, 10], spacing=5)
+        table.bind(minimum_height=table.setter('height'))
+
+        # Adicionar cabeçalho da tabela
+        headers = ["ID", "Nome", "Data/Hora", "Tipo"]
+        for header in headers:
+            header_label = Label(
+                text=header,
+                color=(1, 1, 1, 1),
+                bold=True,
+                size_hint_y=None,
+                height=40,
+                halign='center',
+                valign='middle'
+            )
+            header_label.bind(size=header_label.setter('text_size'))
+            table.add_widget(header_label)
+
+        # Carregar os logs do banco de dados
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT id, name, date_time, log_type FROM face_logs ORDER BY id DESC')
+        logs = c.fetchall()
+        conn.close()
+
+        for log_id, name, dt, log_type in logs:
+            # Garantir que os valores não sejam None
+            log_id = log_id if log_id is not None else "N/A"
+            name = name if name is not None else "N/A"
+            dt = dt if dt is not None else "N/A"
+            log_type = log_type if log_type is not None else "N/A"
+
+            # Define a cor para o tipo (Entrada ou Saída)
+            bg_color = (0.2, 0.8, 0.2, 1) if log_type == "Entrada" else (0.8, 0.2, 0.2, 1)
+
+            # Adiciona os dados na tabela
+            for value in [str(log_id), name, dt, log_type]:
+                cell_label = Label(
+                    text=value,
+                    color=(1, 1, 1, 1),
+                    size_hint_y=None,
+                    height=40,
+                    halign='center',
+                    valign='middle'
+                )
+                cell_label.bind(size=cell_label.setter('text_size'))
+                table.add_widget(cell_label)
+
+        # Adiciona a tabela ao container
+        self.logs_container.add_widget(table)
+
+
+
 
     def on_export_csv(self, instance):
         """
@@ -762,8 +1058,13 @@ class MyScreenManager(ScreenManager):
 class FaceApp(App):
     def build(self):
         self.title = "IPontoApp"
-        create_db_if_not_exists()
+        create_db_if_not_exists()           # Cria as tabelas, se necessário
+        ensure_encoding_hash_column()       # Garante que a coluna exista
+        update_existing_encodings_with_hash()  # Atualiza registros antigos
+        update_db_schema()                  # Outros ajustes no banco
         return MyScreenManager()
+
+
 
 
 if __name__ == "__main__":
